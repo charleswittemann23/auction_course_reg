@@ -1,0 +1,5 @@
+# Hybrid Auction for Course Allocation
+# Requirements for running the simulation
+
+numpy>=1.21.0
+scipy>=1.9.0
