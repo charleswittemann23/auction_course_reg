@@ -130,18 +130,19 @@ class HybridAuction:
         Run the hybrid auction allocation.
         
         Steps:
-        1. Sort all bids by effective bid (bid * priority_weight) descending
+        1. Sort all bids by priority-weighted valuation (true_valuation * priority_weight) descending
         2. Greedily allocate bids to courses if capacity allows
         3. Compute clearing prices for allocated students
         """
-        # Step 1: Calculate effective bids and sort
+        # Step 1: Calculate priority-weighted valuations and sort
         scored_bids = []
         for bid in self.bids:
             student = self.students[bid.student_id]
-            effective_bid = student.effective_bid(bid.bid_amount)
-            scored_bids.append((effective_bid, bid))
+            # Priority-weighted valuation (not bid!)
+            priority_weighted_val = bid.true_valuation * student.priority_weight
+            scored_bids.append((priority_weighted_val, bid))
         
-        # Sort by effective bid descending
+        # Sort by priority-weighted valuation descending
         scored_bids.sort(key=lambda x: -x[0])
         
         # Step 2: Greedy allocation
@@ -197,7 +198,7 @@ class HybridAuction:
         allocations: Dict[str, str]
     ) -> Dict[str, float]:
         """
-        Compute literal clearing prices: each allocated student pays the effective bid of the first unallocated bid for their course (or reserve price if none).
+        Compute clearing prices: each allocated student pays based on priority-weighted valuation.
         """
         clearing_prices = {}
         # Build a lookup for all bids by course
@@ -211,11 +212,11 @@ class HybridAuction:
             student = self.students[student_id]
             course = self.courses[course_id]
 
-            # Get all bids for this course, sorted by effective bid descending
+            # Get all bids for this course, sorted by priority-weighted valuation descending
             bids_for_course = course_bids[course_id]
             bids_for_course_sorted = sorted(
                 bids_for_course,
-                key=lambda b: -self.students[b.student_id].effective_bid(b.bid_amount)
+                key=lambda b: -b.true_valuation * self.students[b.student_id].priority_weight
             )
 
             # Find the cutoff: the first unallocated bid after the allocated ones
@@ -230,7 +231,9 @@ class HybridAuction:
                 else:
                     if count == course.capacity:
                         # This is the first unallocated bid after all seats filled
-                        clearing_price = max(b.bid_amount, course.reserve_price)
+                        # Use priority-weighted valuation as price
+                        pw_val = b.true_valuation * self.students[b.student_id].priority_weight
+                        clearing_price = max(pw_val / self.students[b.student_id].priority_weight, course.reserve_price)
                         found = True
                         break
             # If not enough unallocated bids, use reserve price

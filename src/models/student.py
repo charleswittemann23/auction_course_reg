@@ -15,8 +15,10 @@ class Student:
     clearing_price: float = 0.0
     
     def __post_init__(self):
-        # Priority weight: linear formula (1.0 + 0.25 * seniority)
-        self.priority_weight = 1.0 + 0.25 * self.seniority_years
+        # Priority weight: linear formula with mild seniority bonus (1.0 + 0.1 * seniority)
+        # This gives: Year 1=1.1, Year 2=1.2, Year 3=1.3, Year 4=1.4
+        # Max priority ratio: 1.4/1.1 ≈ 27% (vs previous 60%)
+        self.priority_weight = 1.0 + 0.1 * self.seniority_years
     
     def effective_bid(self, bid_amount: float) -> float:
         """Calculate effective bid with priority weight."""

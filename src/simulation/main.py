@@ -8,7 +8,10 @@ from dataclasses import asdict
 import numpy as np
 
 from ..auction.hybrid_auction import HybridAuction
+from ..auction.rsd_mechanism import RandomSerialDictatorship
 from ..analysis.metrics import EfficiencyCalculator
+from ..models.course import Course
+from ..models.bid import Bid
 
 
 def create_default_courses(num_courses: int = 5) -> List[Dict]:
@@ -195,10 +198,22 @@ def main():
         '--seed', type=int,
         help='Random seed for reproducibility'
     )
+    parser.add_argument(
+        '-c', '--compare', action='store_true',
+        help='Compare auction vs RSD (random serial dictatorship)'
+    )
     
     args = parser.parse_args()
     
-    if args.runs == 1:
+    if args.compare:
+        # Run comparison mode
+        result = run_comparison(
+            n_students=args.students,
+            n_courses=args.courses,
+            n_runs=args.runs
+        )
+        print_comparison_report(result)
+    elif args.runs == 1:
         # Single run
         result = run_single_auction(
             n_students=args.students,
@@ -220,6 +235,183 @@ def main():
         with open(args.output, 'w') as f:
             json.dump(result, f, indent=2, default=str)
         print(f"Results saved to {args.output}")
+
+
+# =============================================================================
+# Comparison Functions: Auction vs RSD
+# =============================================================================
+
+def run_comparison(
+    n_students: int,
+    n_courses: int,
+    n_runs: int = 10,
+    bids_per_student: tuple = (2, 5),
+    random_seed: Optional[int] = None
+) -> Dict:
+    """
+    Run both auction and RSD mechanisms and compare results.
+    
+    Uses the same underlying data (students, courses, bids) for fair comparison.
+    """
+    if random_seed is not None:
+        random.seed(random_seed)
+    
+    all_results = []
+    
+    for i in range(n_runs):
+        seed = random.randint(1, 100000)
+        
+        # Run Hybrid Auction
+        auction = HybridAuction(random_seed=seed)
+        auction.generate_students(n_students)
+        courses = create_default_courses(n_courses)
+        auction.generate_courses(courses)
+        auction.generate_bids(bids_per_student=bids_per_student)
+        
+        auction_result = auction.allocate()
+        auction_calculator = EfficiencyCalculator(
+            auction.students, auction.courses, auction.bids
+        )
+        auction_metrics = auction_calculator.get_full_report(auction_result)
+        
+        # Run RSD with SAME data (reuse students, courses, bids)
+        rsd = RandomSerialDictatorship(random_seed=seed)
+        rsd.students = auction.students
+        rsd.courses = {cid: Course(
+            id=c.id, name=c.name, capacity=c.capacity, reserve_price=c.reserve_price
+        ) for cid, c in auction.courses.items()}
+        rsd.bids = [Bid(
+            student_id=b.student_id,
+            course_id=b.course_id,
+            bid_amount=b.bid_amount,
+            true_valuation=b.true_valuation
+        ) for b in auction.bids]
+        
+        # Use seniority-based priority (seniors go before juniors)
+        rsd_result = rsd.allocate(use_seniority_priority=True)
+        
+        # Calculate RSD metrics
+        rsd_welfare = rsd_result.total_welfare
+        rsd_allocation_rate = len(rsd_result.allocations) / len(rsd.students)
+        rsd_capacity_util = sum(len(c.enrolled_students) for c in rsd.courses.values()) / sum(c.capacity for c in rsd.courses.values())
+        
+        # Calculate priority-weighted welfare for both mechanisms
+        # For RSD: sum of (student priority weight * their course valuation)
+        rsd_priority_welfare = 0.0
+        for sid, course_id in rsd_result.allocations.items():
+            for b in auction.bids:
+                if b.student_id == sid and b.course_id == course_id:
+                    rsd_priority_welfare += auction.students[sid].priority_weight * b.true_valuation
+                    break
+        
+        all_results.append({
+            'run': i + 1,
+            'seed': seed,
+            'auction': {
+                'welfare': auction_metrics['total_welfare'],
+                'priority_weighted_welfare': auction_metrics.get('priority_weighted_welfare', 0),
+                'optimal_welfare': auction_metrics['optimal_welfare'],
+                'efficiency_gap': auction_metrics['efficiency_gap'],
+                'revenue': auction_metrics['revenue'],
+                'allocation_rate': auction_metrics['allocation_rate'],
+                'capacity_utilization': auction_metrics['capacity_utilization']
+            },
+            'rsd': {
+                'welfare': rsd_welfare,
+                'priority_weighted_welfare': rsd_priority_welfare,
+                'allocation_rate': rsd_allocation_rate,
+                'capacity_utilization': rsd_capacity_util
+            }
+        })
+    
+    # Aggregate results
+    return _aggregate_comparison(all_results)
+
+
+def _aggregate_comparison(results: List[Dict]) -> Dict:
+    """Aggregate comparison results across multiple runs."""
+    auction_welfare = [r['auction']['welfare'] for r in results]
+    rsd_welfare = [r['rsd']['welfare'] for r in results]
+    auction_priority_welfare = [r['auction'].get('priority_weighted_welfare', 0) for r in results]
+    rsd_priority_welfare = [r['rsd'].get('priority_weighted_welfare', 0) for r in results]
+    auction_efficiency = [1 - r['auction']['efficiency_gap'] for r in results]
+    auction_revenue = [r['auction']['revenue'] for r in results]
+    auction_allocation = [r['auction']['allocation_rate'] for r in results]
+    rsd_allocation = [r['rsd']['allocation_rate'] for r in results]
+    
+    return {
+        'parameters': {
+            'n_runs': len(results)
+        },
+        'auction': {
+            'welfare': _stats(auction_welfare),
+            'priority_weighted_welfare': _stats(auction_priority_welfare),
+            'efficiency': _stats(auction_efficiency),
+            'revenue': _stats(auction_revenue),
+            'allocation_rate': _stats(auction_allocation)
+        },
+        'rsd': {
+            'welfare': _stats(rsd_welfare),
+            'priority_weighted_welfare': _stats(rsd_priority_welfare),
+            'allocation_rate': _stats(rsd_allocation)
+        },
+        'comparison': {
+            'welfare_diff_mean': np.mean([a - r for a, r in zip(auction_welfare, rsd_welfare)]),
+            'welfare_pct_improvement': np.mean([(a - r) / r * 100 if r > 0 else 0 for a, r in zip(auction_welfare, rsd_welfare)]),
+            'priority_welfare_diff_mean': np.mean([a - r for a, r in zip(auction_priority_welfare, rsd_priority_welfare)]),
+            'priority_welfare_pct_improvement': np.mean([(a - r) / r * 100 if r > 0 else 0 for a, r in zip(auction_priority_welfare, rsd_priority_welfare)]),
+            'allocation_diff_mean': np.mean([a - r for a, r in zip(auction_allocation, rsd_allocation)])
+        },
+        'individual_results': results
+    }
+
+
+def _stats(values: List[float]) -> Dict:
+    """Compute statistics for a list of values."""
+    return {
+        'mean': np.mean(values),
+        'std': np.std(values),
+        'min': np.min(values),
+        'max': np.max(values)
+    }
+
+
+def print_comparison_report(report: Dict):
+    """Print a formatted comparison report."""
+    print("\n" + "="*70)
+    print("MECHANISM COMPARISON: AUCTION vs RANDOM SERIAL DICTATORSHIP")
+    print("="*70)
+    print(f"\nRuns: {report['parameters']['n_runs']}")
+    
+    print("\n" + "-"*70)
+    print("AUCTION MECHANISM")
+    print("-"*70)
+    a = report['auction']
+    print(f"  Total Welfare:              ${a['welfare']['mean']:,.0f} ± ${a['welfare']['std']:,.0f}")
+    print(f"  Priority-Weighted Welfare: ${a['priority_weighted_welfare']['mean']:,.0f} ± ${a['priority_weighted_welfare']['std']:,.0f}")
+    print(f"  Efficiency:                 {a['efficiency']['mean']*100:.1f}% ± {a['efficiency']['std']*100:.1f}%")
+    print(f"  Revenue:                    ${a['revenue']['mean']:,.0f} ± ${a['revenue']['std']:,.0f}")
+    print(f"  Allocation Rate:            {a['allocation_rate']['mean']*100:.1f}% ± {a['allocation_rate']['std']*100:.1f}%")
+    
+    print("\n" + "-"*70)
+    print("RANDOM SERIAL DICTATORSHIP (Current System with Seniority)")
+    print("-"*70)
+    r = report['rsd']
+    print(f"  Total Welfare:              ${r['welfare']['mean']:,.0f} ± ${r['welfare']['std']:,.0f}")
+    print(f"  Priority-Weighted Welfare:  ${r['priority_weighted_welfare']['mean']:,.0f} ± ${r['priority_weighted_welfare']['std']:,.0f}")
+    print(f"  Allocation Rate:            {r['allocation_rate']['mean']*100:.1f}% ± {r['allocation_rate']['std']*100:.1f}%")
+    
+    print("\n" + "-"*70)
+    print("COMPARISON SUMMARY")
+    print("-"*70)
+    c = report['comparison']
+    print(f"  Raw Welfare Δ:              ${c['welfare_diff_mean']:,.0f} (avg)")
+    print(f"  Raw Welfare Change:          {c['welfare_pct_improvement']:.1f}%")
+    print(f"  Priority-Weighted Δ:         ${c['priority_welfare_diff_mean']:,.0f} (avg)")
+    print(f"  Priority-Weighted Change:    {c['priority_welfare_pct_improvement']:.1f}%")
+    print(f"  Allocation Rate Δ:           {c['allocation_diff_mean']*100:+.1f}%")
+    
+    print("\n" + "="*70 + "\n")
 
 
 if __name__ == '__main__':
